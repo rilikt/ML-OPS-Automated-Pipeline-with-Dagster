@@ -1,0 +1,10 @@
+[project]
+name = "part3"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.9"
+dependencies = [
+    "dagster>=1.10.15",
+    "dagster-webserver>=1.10.15",
+    "pandas>=2.2.3",
+]
