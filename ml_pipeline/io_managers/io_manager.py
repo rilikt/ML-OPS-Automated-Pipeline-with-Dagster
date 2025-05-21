@@ -7,9 +7,8 @@ import joblib
 class LocalCSVIOManager(IOManager):
     def handle_output(self, context, obj):
         output_name = context.asset_key.path[-1] # gets the current asset name
-        path = f"resources/{output_name}.csv"
+        path = f"outputs/{output_name}.csv"
         os.makedirs(os.path.dirname(path), exist_ok=True)
-
         obj.to_csv(path, index=False)
         context.log.info(f"Saved output to {path}")
 
@@ -18,7 +17,7 @@ class LocalCSVIOManager(IOManager):
         if input_name == "raw_data":
             path = "data/hour.csv"
         else:
-            path = f"resources/{input_name}.csv"
+            path = f"outputs/{input_name}.csv"
         context.log.info(f"Loading input from {path}")
         return pd.read_csv(path)
 
