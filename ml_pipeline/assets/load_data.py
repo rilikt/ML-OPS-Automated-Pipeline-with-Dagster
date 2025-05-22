@@ -1,6 +1,6 @@
 import pandas as pd
 import dagster as dg
-from dagster import file_relative_path, AssetOut
+from dagster import file_relative_path, AssetOut, AssetExecutionContext
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
@@ -19,6 +19,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
+from typing import Tuple
+from dagster import multi_asset, Output, Out
 
 
 @dg.asset
@@ -31,7 +33,6 @@ def raw_data() -> pd.DataFrame:
         pd.DataFrame
     """
     return pd.read_csv("data/hour.csv")
-
 
 @dg.asset(deps=['raw_data'])
 def feature_engineering(raw_data: pd.DataFrame) -> pd.DataFrame:
@@ -53,8 +54,21 @@ def feature_engineering(raw_data: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-@dg.asset(deps=['feature_engineering'], io_manager_key='joblib_io_manager')
-def preprocessing(feature_engineering: pd.DataFrame) -> ColumnTransformer:
+@multi_asset(
+    outs={
+        "train_data": AssetOut(io_manager_key='io_manager'),
+        "test_data": AssetOut(io_manager_key='io_manager'),
+    },
+    deps=['feature_engineering'],
+)
+def train_test_sets(feature_engineering: pd.DataFrame):
+    train_df, test_df = train_test_split(feature_engineering, test_size=0.2, random_state=42)
+    yield Output(train_df, "train_data")
+    yield Output(test_df, "test_data")
+
+
+@dg.asset(io_manager_key='joblib_io_manager')
+def preprocessing() -> Pipeline:
     categorial_features = ['season', 'weathersit', 'yr']
     numerical_features = ['temp', 'comfort_index']
 
@@ -76,31 +90,51 @@ def preprocessing(feature_engineering: pd.DataFrame) -> ColumnTransformer:
         remainder = 'passthrough'
     )
 
-    return ct
-
-@dg.asset(deps=['preprocessing'], io_manager_key='joblib_io_manager')
-def train_model(context, feature_engineering: pd.DataFrame, preprocessing: ColumnTransformer) -> Pipeline:
-    include = ['season', 'yr', 'hr_sin', 'hr_cos', 'mnth_sin','mnth_cos','weekday_sin', 'comfort_index','weekday_cos', 'workingday', 'holiday', 'weathersit', 'temp']
-    data = feature_engineering
-    X = data[include].astype('float64')
-    y = data['cnt']
-
-    X_train, X_test, y_train, y_test= train_test_split(X, y, test_size=0.2, random_state=42)
-    input_example = X_train.iloc[:1]
-
     regr = TransformedTargetRegressor(
         regressor=XGBRegressor(),
         func=np.log1p,
         inverse_func=np.expm1
     )
 
-    pipe = Pipeline([('preprocessor', preprocessing), ('regressor', regr)])
-    pipe.fit(X_train, y_train)
-
-    y_pred = pipe.predict(X_test)
-    r2 = r2_score(y_test, y_pred)
-    msle = np.sqrt(mean_squared_log_error(y_test, y_pred))
-    context.log.info(f"Trained model R²: {r2}")
-    context.log.info(f"Trained model Root Mean Squared log error: {msle}")
-
+    pipe = Pipeline([('preprocessor', ct), ('regressor', regr)])
     return pipe
+
+@dg.asset(deps=['train_data'], io_manager_key='joblib_io_manager')
+def train_model(context: AssetExecutionContext, train_data: pd.DataFrame, preprocessing: Pipeline) -> Pipeline:
+    with mlflow.start_run(run_name="dagster_training"):
+        include = ['season', 'yr', 'hr_sin', 'hr_cos', 'mnth_sin','mnth_cos','weekday_sin', 'comfort_index',
+                   'weekday_cos', 'workingday', 'holiday', 'weathersit', 'temp']
+        data = train_data
+        X = data[include].astype('float64')
+        y = data['cnt']
+
+        model = preprocessing
+        model.fit(X, y)
+
+    return model
+
+@dg.asset(deps=['test_data', 'train_model'], io_manager_key='joblib_io_manager')
+def evaluate_model(context: AssetExecutionContext, train_model: Pipeline, test_data: pd.DataFrame) -> Pipeline:
+
+    include = ['season', 'yr', 'hr_sin', 'hr_cos', 'mnth_sin', 'mnth_cos', 'weekday_sin', 'comfort_index',
+               'weekday_cos', 'workingday', 'holiday', 'weathersit', 'temp']
+
+    data = test_data
+    X = data[include].astype('float64')
+    y = data['cnt']
+
+    input_example = X.iloc[:1]
+
+    y_pred = train_model.predict(X)
+    r2 = r2_score(y, y_pred)
+    rmsle = np.sqrt(mean_squared_log_error(y, y_pred))
+    context.log.info(f"Trained model R²: {r2}")
+    context.log.info(f"Trained model Root Mean Squared log error: {rmsle}")
+
+    mlflow.log_param("model_type", "LinearRegression")
+    mlflow.log_param("features_used", include)
+    mlflow.log_metric("r2_score", r2)
+    mlflow.log_metric("rmse", rmsle)
+    mlflow.sklearn.log_model(train_model, artifact_path="model", input_example=input_example)
+
+    return train_model

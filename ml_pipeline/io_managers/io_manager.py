@@ -27,7 +27,8 @@ def local_csv_io(_):
 
 class JoblibIOManager(IOManager):
     def _get_path(self, context):
-        asset_id = "_".join(context.asset_key.path[-1])
+        asset_id = context.asset_key.path[-1]
+        # asset_id = "_".join(context.asset_key.path[-1])
         return f"outputs/{asset_id}.joblib"
 
     def handle_output(self, context, obj):
