@@ -1,6 +1,6 @@
 import pandas as pd
 import dagster as dg
-from dagster import file_relative_path, AssetOut, AssetExecutionContext
+from dagster import AssetOut
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
@@ -9,18 +9,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from xgboost import XGBRegressor
 from sklearn.metrics import r2_score
-from sklearn.linear_model import LinearRegression
-import joblib
-from pathlib import Path
-from sklearn.metrics import mean_squared_log_error, make_scorer
-from sklearn.metrics import mean_squared_error
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_squared_log_error
+from dagster import multi_asset, Output
+from dagster import AssetExecutionContext
+from ..utils.utils import set_features_and_target
 import seaborn as sns
 import matplotlib.pyplot as plt
-import mlflow
-import mlflow.sklearn
-from typing import Tuple
-from dagster import multi_asset, Output, Out
 
 
 @dg.asset
@@ -62,6 +56,13 @@ def feature_engineering(raw_data: pd.DataFrame) -> pd.DataFrame:
     deps=['feature_engineering'],
 )
 def train_test_sets(feature_engineering: pd.DataFrame):
+    """
+    Splitting the data into train and test sets
+    Args:
+        feature_engineering (pd.DataFrame), our feature engineering data
+    Returns:
+        Two dataframes with train and test sets
+    """
     train_df, test_df = train_test_split(feature_engineering, test_size=0.2, random_state=42)
     yield Output(train_df, "train_data")
     yield Output(test_df, "test_data")
@@ -69,6 +70,13 @@ def train_test_sets(feature_engineering: pd.DataFrame):
 
 @dg.asset(io_manager_key='joblib_io_manager')
 def preprocessing() -> Pipeline:
+    """
+    Preprocessing the data and prepare it for machine learning
+    Args:
+        features from our dataset
+    Returns:
+        processed data optimized for training
+    """
     categorial_features = ['season', 'weathersit', 'yr']
     numerical_features = ['temp', 'comfort_index']
 
@@ -99,42 +107,56 @@ def preprocessing() -> Pipeline:
     pipe = Pipeline([('preprocessor', ct), ('regressor', regr)])
     return pipe
 
-@dg.asset(deps=['train_data'], io_manager_key='joblib_io_manager')
+@dg.asset(deps=['train_data'], io_manager_key='joblib_io_manager', required_resource_keys={'mlflow'})
 def train_model(context: AssetExecutionContext, train_data: pd.DataFrame, preprocessing: Pipeline) -> Pipeline:
-    with mlflow.start_run(run_name="dagster_training"):
-        include = ['season', 'yr', 'hr_sin', 'hr_cos', 'mnth_sin','mnth_cos','weekday_sin', 'comfort_index',
-                   'weekday_cos', 'workingday', 'holiday', 'weathersit', 'temp']
-        data = train_data
-        X = data[include].astype('float64')
-        y = data['cnt']
+    """
+    Train a machine learning model
+    Args:
+        our training data, and preprocessing pipeline
+    Returns:
+        a fitted model
+    """
+    mlflow = context.resources.mlflow
 
+    with mlflow.start_run(run_name="dagster_training"):
+        X, y = set_features_and_target(train_data)
         model = preprocessing
         model.fit(X, y)
 
     return model
 
-@dg.asset(deps=['test_data', 'train_model'], io_manager_key='joblib_io_manager')
+@dg.asset(deps=['test_data', 'train_model'], io_manager_key='joblib_io_manager', required_resource_keys={'mlflow'})
 def evaluate_model(context: AssetExecutionContext, train_model: Pipeline, test_data: pd.DataFrame) -> Pipeline:
-
-    include = ['season', 'yr', 'hr_sin', 'hr_cos', 'mnth_sin', 'mnth_cos', 'weekday_sin', 'comfort_index',
-               'weekday_cos', 'workingday', 'holiday', 'weathersit', 'temp']
-
-    data = test_data
-    X = data[include].astype('float64')
-    y = data['cnt']
+    """
+    Evaluate a machine learning model
+    Args:
+        a fitted model and test data set
+    Returns:
+        a fitted model
+    """
+    X, y = set_features_and_target(test_data)
+    mlflow = context.resources.mlflow
 
     input_example = X.iloc[:1]
+    with mlflow.start_run(run_name="dagster_evaluation"):
+        y_pred = train_model.predict(X)
+        r2 = r2_score(y, y_pred)
+        rmsle = np.sqrt(mean_squared_log_error(y, y_pred))
+        context.log.info(f"Trained model R²: {r2}")
+        context.log.info(f"Trained model Root Mean Squared log error: {rmsle}")
 
-    y_pred = train_model.predict(X)
-    r2 = r2_score(y, y_pred)
-    rmsle = np.sqrt(mean_squared_log_error(y, y_pred))
-    context.log.info(f"Trained model R²: {r2}")
-    context.log.info(f"Trained model Root Mean Squared log error: {rmsle}")
+        mlflow.log_param("model_type", "LinearRegression")
+        mlflow.log_metric("r2_score", r2)
+        mlflow.log_metric("rmse", rmsle)
+        mlflow.sklearn.log_model(train_model, artifact_path="model", input_example=input_example)
 
-    mlflow.log_param("model_type", "LinearRegression")
-    mlflow.log_param("features_used", include)
-    mlflow.log_metric("r2_score", r2)
-    mlflow.log_metric("rmse", rmsle)
-    mlflow.sklearn.log_model(train_model, artifact_path="model", input_example=input_example)
+        residuals = y - y_pred
+        sns.scatterplot(x=y_pred, y=residuals, alpha=.5)
+        plt.axhline(0, color='red', linestyle='--')
+        plt.xlabel('Count')
+        plt.ylabel('Predicted')
+        plt.title('Xgboost Regressor')
+        plt.savefig('prediction.png')
+        mlflow.log_artifact('prediction.png')
 
     return train_model

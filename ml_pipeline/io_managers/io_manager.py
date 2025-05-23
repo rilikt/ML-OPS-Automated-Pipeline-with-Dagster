@@ -1,8 +1,7 @@
-from dagster import IOManager, io_manager, AssetMaterialization
+from dagster import IOManager, io_manager
 import pandas as pd
 import os
 import joblib
-
 
 class LocalCSVIOManager(IOManager):
     def handle_output(self, context, obj):
@@ -25,10 +24,11 @@ class LocalCSVIOManager(IOManager):
 def local_csv_io(_):
     return LocalCSVIOManager()
 
+
+
 class JoblibIOManager(IOManager):
     def _get_path(self, context):
         asset_id = context.asset_key.path[-1]
-        # asset_id = "_".join(context.asset_key.path[-1])
         return f"outputs/{asset_id}.joblib"
 
     def handle_output(self, context, obj):
@@ -40,5 +40,6 @@ class JoblibIOManager(IOManager):
         path = self._get_path(context)
         return joblib.load(path)
 
-
-joblib_io_manager = JoblibIOManager()
+@io_manager
+def joblib_io_manager(_):
+    return JoblibIOManager()
